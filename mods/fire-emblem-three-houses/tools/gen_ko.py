@@ -15,10 +15,11 @@ from ld import entry
 from msg import lang
 from own import OWN, REFS_EXTRA
 from refs import REFS
+from layout_fix import fix_turn_overlap
 
 ROOT = 'H:/EdenDuo'
-SRC = ROOT + '/010055D009F78000-FireEmblemThreeHousesDS-1.1.0-multilang.dsmod'   # current build (hashes)
-DST = ROOT + '/010055D009F78000-FireEmblemThreeHousesDS-1.1.0-ko.dsmod'
+SRC = ROOT + '/010055D009F78000-FireEmblemThreeHousesDS-1.1.1-multilang.dsmod'   # current build (hashes)
+DST = ROOT + '/010055D009F78000-FireEmblemThreeHousesDS-1.1.1-ko.dsmod'
 ZIP = DST + '.zip'
 
 KO_STATIC = {
@@ -82,6 +83,7 @@ def walk(o):
             walk(v)
 
 
+print('turn overlap fix:', fix_turn_overlap(manifest), 'widgets')
 walk(manifest['pages'])
 bad = sorted({c for t in used.values() for c in t if c != ' ' and c not in covered})
 print('translated', len(used), 'distinct texts; chars missing from the Korean font:', bad or 'none')

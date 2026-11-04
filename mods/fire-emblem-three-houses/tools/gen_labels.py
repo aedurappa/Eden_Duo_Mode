@@ -12,6 +12,7 @@ import sys
 sys.path.insert(0, '.')
 from own import COLS, OWN, REFS_EXTRA
 from refs import REFS
+from layout_fix import fix_turn_overlap
 
 MODULES = 'H:/EdenDuo/companions/native/modules'
 MANIFEST = sys.argv[1]  # the manifest to read and rewrite
@@ -51,6 +52,7 @@ def walk(o):
             walk(v)
 
 
+print('turn overlap fix:', fix_turn_overlap(manifest), 'widgets')
 walk(manifest['pages'])
 keys = [slug(t) for t in used]
 assert len(set(keys)) == len(keys), 'slug collision'

@@ -6,7 +6,7 @@ import shutil
 import zipfile
 
 ROOT = 'H:/EdenDuo'
-P = ROOT + '/010055D009F78000-FireEmblemThreeHousesDS-1.1.0-multilang.dsmod'
+P = ROOT + '/010055D009F78000-FireEmblemThreeHousesDS-1.1.1-multilang.dsmod'
 DIST = ROOT + '/work/cache/dist'
 LIB = '010055D009F78000.so'
 
@@ -26,7 +26,7 @@ for plat, info in libs.items():
 open(P + '/package.json', 'w', encoding='utf-8', newline='').write(pkg)
 open(P + '/dualscreen/manifest.json', 'w', encoding='utf-8', newline='').write(man)
 
-out = ROOT + '/010055D009F78000-FireEmblemThreeHousesDS-1.1.0-multilang.dsmod.zip'
+out = ROOT + '/010055D009F78000-FireEmblemThreeHousesDS-1.1.1-multilang.dsmod.zip'
 if os.path.exists(out):
     os.remove(out)
 members = ['package.json', 'dualscreen/fe3h_font.txt', 'dualscreen/manifest.json'] + \
