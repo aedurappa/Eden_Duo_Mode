@@ -39,8 +39,9 @@ The change is `mods/fire-emblem-three-houses/patches/0001-fe3h-cjk-glyphs-and-la
   message data, and the companion's fixed labels are published in that language;
 - the manifest's fixed English labels are bound to those published labels (`gen_labels.py`) or,
   for the Korean-only package, replaced by Korean (`gen_ko.py`).
-- the top-bar turn label is two sizes smaller and its number is right aligned before the phase
-  text, so the game's wider words (TURN, TURNO) do not overlap it (`layout_fix.py`).
+- the top-bar turn label and number are smaller and the number is right aligned before the phase
+  text, so the game's wider words (TURN, TURNO) and a two digit number do not overlap
+  (`layout_fix.py`).
 
 Both packages in the Releases were built from exactly this source (see the README of the mod for
 the build steps).
