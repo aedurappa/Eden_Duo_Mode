@@ -1,0 +1,912 @@
+diff --git a/native/modules/010055D009F78000.cpp b/native/modules/010055D009F78000.cpp
+index 861fcac..1f90936 100644
+--- a/native/modules/010055D009F78000.cpp
++++ b/native/modules/010055D009F78000.cpp
+@@ -15,12 +15,16 @@
+ #include "core/mods/dsmod_module_extensions.h"
+ #include "core/mods/modules/dsmod_module_sdk.h"
+ #include "fe3h_assets.h"
++#include "fe3h_labels.h"
+ #include "fe3h_reader.h"
+ 
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <chrono>
+ #include <cmath>
++#include <cstdio>
++#include <future>
+ #include <mutex>
+ #include <string>
+ #include <cstdint>
+@@ -144,6 +148,148 @@ struct Module {
+         return true;
+     }
+ 
++    /// Tick thread: find the language the game runs in and follow it. The language value the game
++    /// keeps (Reader::GameLanguage) is only a hint: the language is the one whose words in the
++    /// romfs message data equal a few words read from the game's memory (fe3h_labels.h,
++    /// MatchLanguage), which cannot be wrong about what the game shows. The CJK glyphs of the font
++    /// depend on it (Han shapes differ per language), so a language found for the first time or
++    /// changed is handed to the asset library and "__font_epoch" counts up: a runtime 18 host
++    /// then calls decode_font again and reloads the atlas pages. The fixed words of the pages
++    /// ("ui.l.*", fe3h_labels.h) follow it too.
++    /// Console checks: "fe.lang" (the game's value, -1 = unreadable), "fe.lang_det" (the language
++    /// found, -1 = none yet), "fe.lab" (0 nothing yet, 1 working, 2 done, 3 done but a game text
++    /// could not be read) and "fe.dbg" (the same as one line).
++    void WatchLanguage(const EdenDsmodHostApi* h) {
++        ++label_samples;
++        const int reader_lang = reader.GameLanguage();
++        if (probe.empty() || label_samples % 30 == 0) // a few RAM strings; none before the texts load
++            probe = reader.LanguageProbe();
++        PublishLabels(h, reader_lang);
++        if (h->publish_i64) {
++            h->publish_i64(h->userdata, "__font_epoch", font_epoch);
++            h->publish_i64(h->userdata, "fe.lang", reader_lang);
++            h->publish_i64(h->userdata, "fe.lang_det", labels_language);
++            h->publish_i64(h->userdata, "fe.lab", label_state);
++        }
++        if (h->publish_text) {
++            char line[96];
++            std::snprintf(line, sizeof(line), "lang game=%d found=%d state=%d probe=%zu str=%.16s",
++                          reader_lang, labels_language, label_state, probe.size(),
++                          debug_label < label_values.size() ? label_values[debug_label].c_str() : "");
++            h->publish_text(h->userdata, "fe.dbg", line);
++        }
++    }
++
++    struct LabelResult {
++        int language{-1}; ///< the language found, -1 = none
++        bool complete{};  ///< every game text was read (else retried later)
++        std::vector<std::string> values;
++    };
++
++    /// The companion's fixed words in `language`: a game term from the game's own message data,
++    /// the rest this companion's own text. Runs off the tick thread (it reads the romfs).
++    LabelResult BuildLabels(int language) const {
++        LabelResult r{language, true, {}};
++        const fe3h_labels::Entry* entries = fe3h_labels::Entries();
++        for (std::size_t i = 0; i < fe3h_labels::EntryCount(); ++i) {
++            const auto& e = entries[i];
++            std::string value;
++            if (e.part >= 0) {
++                std::string game;
++                if (fe3h_assets::GameText(*assets, &host, static_cast<std::uint32_t>(language),
++                                          static_cast<std::uint32_t>(e.part),
++                                          static_cast<std::uint32_t>(e.index), game))
++                    value = fe3h_labels::CleanGameText(game);
++                else
++                    r.complete = false;
++            }
++            r.values.push_back(value.empty() ? std::string{fe3h_labels::Own(e, language)}
++                                             : std::move(value));
++        }
++        return r;
++    }
++
++    /// The language of the game (`probe` = its words from the game's memory, `hint` = the game's
++    /// own language value or -1) and the fixed words in it. Runs off the tick thread.
++    LabelResult ResolveLanguage(int hint, const std::string& probe_text) const {
++        int language = hint;
++        bool readable = true;
++        if (!probe_text.empty()) {
++            int reads = 0;
++            const int found = fe3h_labels::MatchLanguage(
++                probe_text, hint, [&](int lang, std::uint32_t index, std::string& out) {
++                    const bool ok = fe3h_assets::GameText(*assets, &host,
++                                                          static_cast<std::uint32_t>(lang), 1, index, out);
++                    reads += ok ? 1 : 0;
++                    return ok;
++                });
++            if (found >= 0)
++                language = found;
++            else if (reads == 0)
++                readable = false; // the romfs was not readable: try again later
++        }
++        if (language < 0) {
++            LabelResult none;
++            none.complete = false;
++            return none;
++        }
++        LabelResult r = BuildLabels(language);
++        r.complete = r.complete && readable;
++        return r;
++    }
++
++    /// Publishes "ui.l.<key>" for every label: English until the language is found, then that
++    /// language's words (resolved on a worker; an unreadable romfs is retried every 120 samples).
++    void PublishLabels(const EdenDsmodHostApi* h, int reader_lang) {
++        using namespace std::chrono_literals;
++        const fe3h_labels::Entry* entries = fe3h_labels::Entries();
++        if (label_keys.empty()) {
++            for (std::size_t i = 0; i < fe3h_labels::EntryCount(); ++i) {
++                label_keys.push_back(std::string{"ui.l."} + entries[i].key);
++                label_values.emplace_back(fe3h_labels::Own(entries[i], -1));
++                if (std::string_view{entries[i].key} == "str")
++                    debug_label = i;
++            }
++        }
++        if (label_job.valid() && label_job.wait_for(0s) == std::future_status::ready) {
++            LabelResult r = label_job.get();
++            label_state = r.complete ? 2 : 3;
++            if (r.language >= 0) {
++                labels_language = r.language;
++                label_values = std::move(r.values);
++                if (r.language != font_language) {
++                    font_language = r.language;
++                    fe3h_assets::SetFontLanguage(*assets, r.language);
++                    ++font_epoch;
++                }
++            }
++            if (!r.complete) { // look again later (a texts read failed or no language yet)
++                label_retry_at = label_samples + 120;
++                job_key.clear();
++            }
++        }
++        const std::string key = probe + '#' + std::to_string(reader_lang);
++        if (!label_job.valid() && (!probe.empty() || reader_lang >= 0) && key != job_key &&
++            label_samples >= label_retry_at) {
++            job_key = key;
++            label_state = 1;
++            label_job = std::async(std::launch::async, [this, reader_lang, p = probe] {
++                return ResolveLanguage(reader_lang, p);
++            });
++        }
++        if (h->publish_text)
++            for (std::size_t i = 0; i < label_keys.size(); ++i)
++                h->publish_text(h->userdata, label_keys[i].c_str(), label_values[i].c_str());
++    }
++
++    int font_language{-1};
++    std::int64_t font_epoch{0};
++    std::vector<std::string> label_keys, label_values;
++    std::string probe, job_key; ///< the game's words from its memory; what the last job was for
++    int labels_language{-1};    ///< the language found
++    int label_state{0};
++    std::size_t debug_label{static_cast<std::size_t>(-1)};
++    std::uint64_t label_samples{0}, label_retry_at{0};
+     std::mutex arrow_mutex;
+     std::vector<std::uint8_t> arrow_src;
+     std::uint32_t arrow_w{}, arrow_h{}, arrow_side{};
+@@ -151,6 +297,8 @@ struct Module {
+     EdenDsmodHostApi host; // create()'s host table: decode_font gets no host of its own
+     std::unique_ptr<fe3h_assets::Library> assets;
+     Fe3hReader::Reader reader;
++    // last: destroyed (and joined) before the library and the host table the job reads
++    std::future<LabelResult> label_job;
+ };
+ 
+ void* Create(const EdenDsmodHostApi* host, const char* config) {
+@@ -175,8 +323,11 @@ void Destroy(void* p) {
+ void SampleCallback(void* p, const EdenDsmodHostApi* host) {
+     static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+     try {
+-        if (p && host)
+-            static_cast<Module*>(p)->reader.Sample(*host);
++        if (p && host) {
++            auto* m = static_cast<Module*>(p);
++            m->reader.Sample(*host);
++            m->WatchLanguage(host);
++        }
+     } catch (...) {
+         if (!reported.test_and_set() && host && host->log)
+             host->log(host->userdata, EDEN_DSMOD_LOG_ERROR, "FE3H DSMod sample callback failed");
+diff --git a/native/modules/CMakeLists.txt b/native/modules/CMakeLists.txt
+index 8744a71..fc3eb0e 100644
+--- a/native/modules/CMakeLists.txt
++++ b/native/modules/CMakeLists.txt
+@@ -612,6 +612,9 @@ set(FE3H_ASSET_SOURCES
+     fe3h_assets.h
+     fe3h_font.cpp
+     fe3h_font.h
++    fe3h_labels.cpp
++    fe3h_labels.h
++    fe3h_labels_data.inc
+     fe3h_text.cpp
+     fe3h_text.h
+     fe3h_ui2d.cpp
+diff --git a/native/modules/fe3h_assets.cpp b/native/modules/fe3h_assets.cpp
+index 1004dff..9af01c4 100644
+--- a/native/modules/fe3h_assets.cpp
++++ b/native/modules/fe3h_assets.cpp
+@@ -21,6 +21,7 @@
+ #include "fe3h_font.h"
+ #include "fe3h_g1t.h"
+ #include "fe3h_romfs.h"
++#include "fe3h_text.h"
+ #include "fe3h_ui2d.h"
+ 
+ namespace fe3h_assets {
+@@ -240,6 +241,18 @@ public:
+                   uint32_t& index);
+     int WeaponIcon(uint32_t item, uint32_t uses) const; // any thread, never blocks
+     bool DecodeFont(const EdenDsmodHostApi* host, std::span<const uint8_t> bytes, FontOut& out);
++    void SetFontLanguage(int language) {
++        font_language_.store(language, std::memory_order_relaxed);
++    }
++    bool GameText(const EdenDsmodHostApi* host, uint32_t language, uint32_t part, uint32_t index,
++                  std::string& out) {
++        std::scoped_lock lock{io_};
++        if (!Ready(host))
++            return false;
++        if (!messages_)
++            messages_ = std::make_unique<fe3h_text::MessageText>(*link_);
++        return messages_->Get(part, index, out, language);
++    }
+ 
+ private:
+     struct Pixels {
+@@ -298,6 +311,10 @@ private:
+     SourcePtr ui_atlas_[UiAtlasLast - UiAtlasFirst + 1];
+     std::map<uint32_t, SourcePtr> ui_g1t_;
+     SourcePtr font_tex_, stills_, stills_dlc_, faces_dlc_;
++    SourcePtr cjk_tex_[fe3h_font::LangCount]; // LINKDATA 75 / 71 / 74 / 73, KT-gz G1Ts
++    std::atomic<int> font_language_{-1};      // the game's language index, -1 = unknown
++    std::unique_ptr<fe3h_text::MessageText> messages_; // the game's message data (GameText)
++    std::optional<Pixels> FontPage(uint32_t page);
+     uint32_t arc_id_{};
+     std::vector<uint8_t> arc_; // the last ui2d SARC read (they are read whole, <= 18 MiB)
+     std::vector<fe3h_ui2d::SarcFile> arc_files_;
+@@ -458,6 +475,12 @@ std::optional<LibraryImpl::Pixels> LibraryImpl::Fetch(std::string_view key) {
+     const std::string_view kind = part[0];
+     SourcePtr g1t;
+     uint32_t tex = 0;
++    if (kind == "font" && part.size() == 3 && part[1] == "page") {
++        uint32_t page;
++        if (!ParseU32(part[2], page))
++            return std::nullopt;
++        return FontPage(page);
++    }
+     if (kind == "portrait" && n.size() == 1) {
+         g1t = Container(PortraitEntry, portraits_);
+         tex = n[0];
+@@ -538,6 +561,36 @@ std::optional<LibraryImpl::Pixels> LibraryImpl::Fetch(std::string_view key) {
+     return Tex(*g1t, tex);
+ }
+ 
++// One PageRows-high band of the paged font atlas (fe3h_font.h): rows of the Latin atlas or of a
++// CJK atlas. BC3 is stored linearly in 4x4 blocks, so a band is one contiguous byte range and only
++// the KT-gz chunks covering it are inflated. The last band of an atlas can be shorter than
++// PageRows: the missing blocks are zero (fully transparent).
++std::optional<LibraryImpl::Pixels> LibraryImpl::FontPage(uint32_t page) {
++    fe3h_font::PageSource src;
++    if (!fe3h_font::PageSourceOf(page, src))
++        return std::nullopt;
++    const SourcePtr g1t =
++        src.latin ? Container(fe3h_font::TextureEntry, font_tex_)
++                  : Container(fe3h_font::CjkSets[size_t(src.lang)].texture_entry,
++                              cjk_tex_[size_t(src.lang)]);
++    if (!g1t)
++        return std::nullopt;
++    const auto t = fe3h_g1t::Texture(*g1t, 0);
++    constexpr uint8_t Bc3 = 0x5B;
++    if (!t || t->format != Bc3 || t->width != fe3h_font::AtlasWidth ||
++        t->height != (src.latin ? fe3h_font::AtlasHeight : fe3h_font::CjkAtlasH) ||
++        src.y >= t->height || src.y % 4 != 0 || t->height % 4 != 0)
++        return std::nullopt;
++    const uint64_t block_row_bytes = uint64_t(t->width / 4) * 16; // one row of 4x4 blocks
++    const uint32_t rows = std::min(fe3h_font::PageRows, t->height - src.y);
++    Pixels px{t->format, t->width, fe3h_font::PageRows, {}};
++    if (!g1t->ReadVec(t->data_offset + uint64_t(src.y / 4) * block_row_bytes,
++                      size_t(rows / 4) * block_row_bytes, px.data))
++        return std::nullopt;
++    px.data.resize(size_t(fe3h_font::PageRows / 4) * block_row_bytes, 0);
++    return px;
++}
++
+ std::shared_ptr<const Image> LibraryImpl::CacheGet(const std::string& key) {
+     std::scoped_lock lock{cache_mu_};
+     if (const auto found = cache_index_.find(key); found != cache_index_.end()) {
+@@ -2635,15 +2688,32 @@ bool LibraryImpl::DecodeFont(const EdenDsmodHostApi* host, std::span<const uint8
+     if (!fe3h_font::ReadGameTables(*host, tables))
+         return false;
+     std::vector<uint8_t> table;
++    std::vector<fe3h_font::CjkTable> cjk;
+     {
+         std::scoped_lock lock{io_};
+         const SourcePtr e = Ready(host) ? link_->Entry(fe3h_font::CodeTableEntry) : nullptr;
+         if (!e || !e->ReadAll(table, uint64_t{1} << 20))
+             return false;
++        // The game's language set first (its Han shapes), then Korean for the Hangul no other set
++        // has. A set that cannot be read is skipped: the Latin font works without it.
++        std::vector<fe3h_font::Lang> wanted;
++        fe3h_font::Lang active;
++        if (fe3h_font::LangFromIndex(font_language_.load(std::memory_order_relaxed), active) &&
++            active != fe3h_font::Lang::Kor)
++            wanted.push_back(active);
++        wanted.push_back(fe3h_font::Lang::Kor);
++        for (const auto lang : wanted) {
++            std::vector<uint8_t> codes;
++            const SourcePtr c = link_->Entry(fe3h_font::CjkSets[size_t(lang)].code_entry);
++            if (c && c->ReadAll(codes, uint64_t{1} << 20))
++                cjk.push_back({lang, fe3h_font::DecodeCodeTable(codes)});
++        }
+     }
+     fe3h_font::Font font;
+     if (!fe3h_font::Build(face, tables, fe3h_font::DecodeCodeTable(table), font))
+         return false;
++    if (face == fe3h_font::Face::Serif)
++        fe3h_font::AddCjk(font, cjk);
+     out.line_height = font.line_height;
+     out.first_codepoint = font.first_codepoint;
+     out.glyphs.resize(font.glyphs.size());
+@@ -2789,6 +2859,15 @@ bool DecodeFont(Library& lib, const EdenDsmodHostApi* host, const uint8_t* bytes
+     return lib.Impl().DecodeFont(host, std::span<const uint8_t>{bytes, size}, out);
+ }
+ 
++void SetFontLanguage(Library& lib, int language) {
++    lib.Impl().SetFontLanguage(language);
++}
++
++bool GameText(Library& lib, const EdenDsmodHostApi* host, uint32_t language, uint32_t part,
++              uint32_t index, std::string& out) {
++    return lib.Impl().GameText(host, language, part, index, out);
++}
++
+ int MinimapIndex(uint32_t stage, bool flag) {
+     constexpr int Count = 48; // entries in minimap.bin (0x69BF40 rejects index >= count)
+     int idx;
+diff --git a/native/modules/fe3h_assets.h b/native/modules/fe3h_assets.h
+index 4c1a40b..0267006 100644
+--- a/native/modules/fe3h_assets.h
++++ b/native/modules/fe3h_assets.h
+@@ -377,6 +377,18 @@ struct FontOut {
+ bool DecodeFont(Library&, const EdenDsmodHostApi* host, const uint8_t* bytes, size_t size,
+                 FontOut& out);
+ inline constexpr const char* FontAtlasKey = "module:fe3h:font/latin";
++// The paged atlas of the serif face (manifest font_atlas, with font_page_h = fe3h_font::PageRows):
++// the Latin atlas and the game's four CJK atlases as 52-row bands (fe3h_font.h, PageSourceOf).
++// "fe3h:font/page/<n>" is band n of the virtual atlas, 4096 x 52 RGBA.
++inline constexpr const char* FontPageKey = "module:fe3h:font/page/{p}";
++// The game's language index (msgdata order, -1 = not known yet) the CJK glyphs should follow:
++// the next decode_font adds that language's set (and Korean's, for Hangul). Any thread.
++void SetFontLanguage(Library&, int language);
++// A string of the game's own message data (msgdata: language index, part, index; fe3h_text.h), for
++// the companion's labels in the game's language. False while the romfs is not readable or for a
++// bad index. Any thread; reads the romfs, so not for a time-critical thread.
++bool GameText(Library&, const EdenDsmodHostApi* host, uint32_t language, uint32_t part,
++              uint32_t index, std::string& out);
+ 
+ // Published image-source strings ("module:fe3h:...").
+ std::string PortraitKey(uint32_t pid);
+diff --git a/native/modules/fe3h_font.cpp b/native/modules/fe3h_font.cpp
+index 0ec0a20..b235ff8 100644
+--- a/native/modules/fe3h_font.cpp
++++ b/native/modules/fe3h_font.cpp
+@@ -196,6 +196,84 @@ bool Build(Face face, const GameTables& tables, const std::vector<uint32_t>& cod
+     return out.mapped >= 0x5F;
+ }
+ 
++bool LangFromIndex(int index, Lang& out) {
++    switch (index) {
++    case 0:
++        out = Lang::Jpn;
++        return true;
++    case 9:
++        out = Lang::Kor;
++        return true;
++    case 10:
++        out = Lang::Twn;
++        return true;
++    case 11:
++        out = Lang::Chn;
++        return true;
++    default:
++        return false;
++    }
++}
++
++bool CjkCell(uint32_t index, uint32_t& x, uint32_t& y) {
++    x = (index % CjkColumns) * CjkCellSize;
++    y = (index / CjkColumns) * CjkCellSize;
++    return x + CjkCellSize <= CjkAtlasW && y + CjkCellSize <= CjkAtlasH;
++}
++
++uint32_t CjkBase(Lang lang) {
++    return LatinPages * PageRows + uint32_t(lang) * CjkPages * PageRows;
++}
++
++bool PageSourceOf(uint32_t page, PageSource& out) {
++    if (page >= PageCount)
++        return false;
++    if (page < LatinPages) {
++        out = {true, Lang::Kor, page * PageRows};
++        return true;
++    }
++    const uint32_t k = page - LatinPages;
++    out = {false, Lang(k / CjkPages), (k % CjkPages) * PageRows};
++    return true;
++}
++
++namespace {
++
++bool IsHangul(uint32_t cp) {
++    return (cp >= 0xAC00 && cp <= 0xD7A3) || (cp >= 0x1100 && cp <= 0x11FF) ||
++           (cp >= 0x3130 && cp <= 0x318F);
++}
++
++} // namespace
++
++void AddCjk(Font& font, std::span<const CjkTable> tables) {
++    if (font.first_codepoint != FirstCodepoint)
++        return;
++    for (const CjkTable& t : tables) {
++        const uint32_t base = CjkBase(t.lang);
++        for (uint32_t i = 0; i < t.codes.size(); ++i) {
++            const uint32_t cp = t.codes[i];
++            uint32_t x, y;
++            if (cp < FirstCodepoint || cp > CjkLastCodepoint || !CjkCell(i, x, y))
++                continue;
++            const size_t slot = cp - FirstCodepoint;
++            if (slot >= font.glyphs.size())
++                font.glyphs.resize(slot + 1);
++            Glyph& g = font.glyphs[slot];
++            if (g.advance)
++                continue; // Latin (or an earlier set) already has this code point
++            g = {uint16_t(x),
++                 uint16_t(base + y),
++                 uint16_t(CjkCellSize),
++                 uint16_t(CjkCellSize),
++                 0,
++                 int16_t(CjkCellSize),
++                 uint16_t(IsHangul(cp) ? HangulAdvance : CjkAdvance)};
++            ++font.mapped;
++        }
++    }
++}
++
+ bool ParseRequest(std::span<const uint8_t> bytes, Face& face) {
+     const std::string_view s{reinterpret_cast<const char*>(bytes.data()), bytes.size()};
+     constexpr std::string_view Magic = "FE3HFONT ";
+diff --git a/native/modules/fe3h_font.h b/native/modules/fe3h_font.h
+index 118b8b8..c1d0059 100644
+--- a/native/modules/fe3h_font.h
++++ b/native/modules/fe3h_font.h
+@@ -106,4 +106,76 @@ bool Build(Face face, const GameTables& tables, const std::vector<uint32_t>& cod
+ // "FE3HFONT sans" (any trailing text ignored). False for anything else.
+ bool ParseRequest(std::span<const uint8_t> bytes, Face& face);
+ 
++// ---- CJK: the game's own per-language atlases (serif face only) ------------------------------
++//
++// The Latin font has no Hangul, kana or Han. The game ships one 4096 x 4096 BC3 G1T per CJK
++// language (white + alpha, 52 x 52 cells, 78 per row, cell = row * 78 + column, one 20-byte
++// texture header like LINKDATA 72) and a UTF8TBL for it (cell index -> code point, the same
++// layout as the Latin table 77):
++//
++//   language  msgdata index  atlas  table
++//   Korean    9              75     80    2350 KS X 1001 syllables + jamo + kana + symbols
++//   Japanese  0              71     76
++//   Trad. Chinese (TWN) 10   74     78
++//   Simpl. Chinese (CHN) 11  73     79
++//
++// The sets share Han code points with different shapes, so only the game's language set (plus
++// Korean for Hangul, which no other set has) joins the Latin glyphs, and a code point the Latin
++// font already has stays Latin. The glyphs are a whole cell; no metrics exist in the game's
++// tables for them, so the advance is a constant (Hangul 51, the rest 52: all full width).
++//
++// Paged atlas (manifest font_page_h = PageRows, font_atlas = module:fe3h:font/page/{p}): the
++// virtual atlas stacks a slot for the Latin atlas (LatinPages pages), then one slot of CjkPages
++// pages per set in the order of `Lang`, so a page is a PageRows-high band of exactly one game
++// atlas (the rows past the end of the atlas are transparent). PageRows is one cell row (52 px; a
++// multiple of the BC3 block height 4 too): no cell straddles two pages, and a page holds only 78
++// glyphs. The host keeps 32 MiB of pages and draws a glyph whose page is not resident blank, so the
++// pages one screen of text touches must stay few: with 4-row pages (312 glyphs, 3.4 MB) a screen
++// of 77 different syllables touched 9 Hangul pages plus the Latin ones (37 MB) and glyphs came
++// and went; with one-row pages (0.85 MB) it is about 31 pages (26 MB).
++enum class Lang : uint8_t { Kor, Jpn, Twn, Chn };
++inline constexpr size_t LangCount = 4;
++
++struct CjkSet {
++    uint32_t texture_entry; // LINKDATA id of the G1T
++    uint32_t code_entry;    // LINKDATA id of the UTF8TBL
++};
++inline constexpr CjkSet CjkSets[LangCount] = {{75, 80}, {71, 76}, {74, 78}, {73, 79}};
++
++inline constexpr uint32_t CjkAtlasW = 4096, CjkAtlasH = 4096;
++inline constexpr uint32_t CjkCellSize = 52, CjkColumns = 78;
++inline constexpr uint32_t PageRows = CjkCellSize; // 52
++inline constexpr uint32_t LatinPages = (AtlasHeight + PageRows - 1) / PageRows;  // 10
++inline constexpr uint32_t CjkPages = (CjkAtlasH + PageRows - 1) / PageRows;      // 79
++inline constexpr uint32_t HangulAdvance = 51, CjkAdvance = 52;
++inline constexpr uint32_t CjkLastCodepoint = 0xD7FF; // below the surrogates; keeps the run dense
++
++// Game language index (msgdata order: 0 JPN, 1.. Latin languages, 9 KOR, 10 TWN, 11 CHN) -> the
++// CJK set for it; false for the Latin-script languages (and anything out of range).
++bool LangFromIndex(int index, Lang& out);
++
++// Cell of a glyph index inside a CJK atlas; false out of range.
++bool CjkCell(uint32_t index, uint32_t& x, uint32_t& y);
++// First row of a set in the virtual atlas.
++uint32_t CjkBase(Lang lang);
++
++// Where the rows of virtual page `page` come from: the Latin atlas (latin = true) or a CJK atlas,
++// starting at row `y` of that atlas. False beyond the virtual atlas.
++struct PageSource {
++    bool latin{};
++    Lang lang{};
++    uint32_t y{};
++};
++bool PageSourceOf(uint32_t page, PageSource& out);
++inline constexpr uint32_t PageCount = LatinPages + uint32_t(LangCount) * CjkPages;
++
++struct CjkTable {
++    Lang lang{};
++    std::vector<uint32_t> codes; // DecodeCodeTable of the set's UTF8TBL
++};
++
++// Adds the glyphs of `tables` (earlier tables win) to a serif font from Build: only code points
++// that have no glyph yet. Extends the dense run up to CjkLastCodepoint as needed.
++void AddCjk(Font& font, std::span<const CjkTable> tables);
++
+ } // namespace fe3h_font
+diff --git a/native/modules/fe3h_labels.cpp b/native/modules/fe3h_labels.cpp
+new file mode 100644
+index 0000000..234858e
+--- /dev/null
++++ b/native/modules/fe3h_labels.cpp
+@@ -0,0 +1,93 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden_Duo_Mode contributors
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include "fe3h_labels.h"
++
++namespace fe3h_labels {
++namespace {
++
++constexpr Entry Table[] = {
++#include "fe3h_labels_data.inc"
++};
++
++} // namespace
++
++const Entry* Entries() {
++    return Table;
++}
++
++size_t EntryCount() {
++    return sizeof(Table) / sizeof(Table[0]);
++}
++
++Column ColumnOf(int language) {
++    switch (language) {
++    case 0:
++        return Ja;
++    case 3:
++        return De;
++    case 4:
++    case 5:
++        return Fr;
++    case 6:
++    case 7:
++        return Es;
++    case 8:
++        return It;
++    case 9:
++        return Ko;
++    case 10:
++        return Twn;
++    case 11:
++        return Chn;
++    default: // 1 / 2 English, and an unknown language
++        return En;
++    }
++}
++
++const char* Own(const Entry& entry, int language) {
++    const char* text = entry.own[ColumnOf(language)];
++    return text ? text : entry.own[En];
++}
++
++std::string CleanGameText(const std::string& text) {
++    std::string out;
++    out.reserve(text.size());
++    for (const char c : text)
++        if (static_cast<unsigned char>(c) >= 0x20)
++            out.push_back(c);
++    return out;
++}
++
++std::string BuildProbe(const TextGetter& get) {
++    std::string probe;
++    for (const uint32_t index : ProbeIndices) {
++        std::string text;
++        if (!get(index, text))
++            return {};
++        text = CleanGameText(text);
++        if (text.empty())
++            return {};
++        probe += text;
++        probe += '|';
++    }
++    return probe;
++}
++
++int MatchLanguage(const std::string& probe, int preferred,
++                  const std::function<bool(int, uint32_t, std::string&)>& get) {
++    if (probe.empty())
++        return -1;
++    const auto matches = [&](int language) {
++        return BuildProbe([&](uint32_t index, std::string& out) { return get(language, index, out); }) ==
++               probe;
++    };
++    if (preferred >= 0 && preferred < LanguageCount && matches(preferred))
++        return preferred;
++    for (int language = 0; language < LanguageCount; ++language)
++        if (language != preferred && matches(language))
++            return language;
++    return -1;
++}
++
++} // namespace fe3h_labels
+diff --git a/native/modules/fe3h_labels.h b/native/modules/fe3h_labels.h
+new file mode 100644
+index 0000000..cc14efd
+--- /dev/null
++++ b/native/modules/fe3h_labels.h
+@@ -0,0 +1,66 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden_Duo_Mode contributors
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++
++// Fire Emblem: Three Houses (010055D009F78000): the companion's fixed words in the game's language.
++//
++// The manifest's `label` widgets bind "ui.l.<key>" (bind_text) instead of carrying English; the
++// module publishes the text for the game's language under those keys. Two sources:
++//   - a game term (a stat, a weapon skill, "Victory Conditions" ...) is read from the game's own
++//     message data at run time in the game's language (fe3h_text.h: part, index), so no game
++//     text ships and the wording is the game's;
++//   - a phrase the game has no word for is this companion's own text, one per column below
++//     (English = the fallback of everything).
++// The table is fe3h_labels_data.inc (generated).
++
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <string>
++
++namespace fe3h_labels {
++
++// Own-text columns. The game's 12 languages share nine of them (msgdata order: 0 JPN, 1 ENG_U,
++// 2 ENG_E, 3 GER, 4 FRA_E, 5 FRA_U, 6 ESP_E, 7 ESP_U, 8 ITA, 9 KOR, 10 TWN, 11 CHN).
++enum Column : int { En, Ja, De, Fr, Es, It, Ko, Twn, Chn, ColumnCount };
++
++struct Entry {
++    const char* key;      // published as "ui.l." + key
++    int part;             // game text part (fe3h_text.h), -1 = none
++    int index;            // game text index in that part
++    const char* own[ColumnCount]; // nullptr = use En
++};
++
++// The table (generated) and its size.
++const Entry* Entries();
++size_t EntryCount();
++
++// Column of a game language index; English for an unknown (negative / out of range) one.
++Column ColumnOf(int language);
++
++// The text of `entry` in `language` without the game's text (own column, else English).
++const char* Own(const Entry& entry, int language);
++
++// A game text made fit for a label: the control codes (< 0x20) removed.
++std::string CleanGameText(const std::string& text);
++
++// ---- which language is the game running? ----------------------------------------------------
++// The game's language value (fe3h_reader.h, GameLanguage) can be wrong or unreadable, so the
++// language is also found by the game's own words: a few terms of message part 1 are read from the
++// game's memory and compared with the same terms of each language in the romfs message data. The
++// terms tell the CJK languages and German / French / Spanish / Italian apart; the regional
++// variants (ENG_U / ENG_E, FRA_E / FRA_U, ESP_E / ESP_U) have the same words here, so the first
++// (or the preferred) of them is taken, which is all the companion needs.
++inline constexpr uint32_t ProbeIndices[] = {257, 259, 598, 283, 284}; // Stats, Skill Level, Victory
++                                                                      // Conditions, Hit, Crit
++inline constexpr int LanguageCount = 12;
++// Reads one message-part-1 string by index; false when it is not available (yet).
++using TextGetter = std::function<bool(uint32_t index, std::string& out)>;
++// The terms joined with '|' (control codes removed); empty when any of them is not available.
++std::string BuildProbe(const TextGetter& get);
++// The language whose terms equal `probe`: `preferred` first, then 0..11; -1 when none matches or
++// the probe is empty. get(language, index, out) reads the message data of that language.
++int MatchLanguage(const std::string& probe, int preferred,
++                  const std::function<bool(int language, uint32_t index, std::string& out)>& get);
++
++} // namespace fe3h_labels
+diff --git a/native/modules/fe3h_labels_data.inc b/native/modules/fe3h_labels_data.inc
+new file mode 100644
+index 0000000..302e672
+--- /dev/null
++++ b/native/modules/fe3h_labels_data.inc
+@@ -0,0 +1,116 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden_Duo_Mode contributors
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Generated (gen_labels.py): the localizable labels of the manifest. {key, game text part,
++// game text index (part < 0: none), own text per column: en ja de fr es it ko twn chn}.
++// A game text entry reads its word from the game's own msgdata in the game's language; its
++// English text is the fallback. The other entries are this companion's own wording.
++    {"abilities", 1, 260, {"Abilities", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"academy", -1, 0, {"Academy", "士官学校", "Akademie", "Académie", "Academia", "Accademia", "사관학교", "士官學校", "士官学校"}},
++    {"all", 1, 788, {"All", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"ally", -1, 0, {"Ally", "友軍", "Verbündete", "Alliés", "Aliados", "Alleati", "우군", "友軍", "友军"}},
++    {"ally_units", 1, 882, {"Ally Units", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"as", 1, 277, {"As", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"authority", 2, 7221, {"Authority", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"available", 1, 660, {"Available", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"avo", 1, 286, {"Avo", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"axe", 2, 7216, {"Axe", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"back", 1, 359, {"Back", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"battalion", 1, 410, {"Battalion", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"battle_forecast", -1, 0, {"Battle Forecast", "戦闘予測", "Kampfvorschau", "Prévision du combat", "Previsión de combate", "Previsione di battaglia", "전투 예측", "戰鬥預測", "战斗预测"}},
++    {"bow", 2, 7217, {"Bow", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"brawling", 2, 7218, {"Brawling", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"calendar", -1, 0, {"Calendar", "カレンダー", "Kalender", "Calendrier", "Calendario", "Calendario", "달력", "日曆", "日历"}},
++    {"cha", 1, 274, {"Cha", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"char", -1, 0, {"Char", "キャラ", "Figur", "Perso.", "Pers.", "Pers.", "캐릭터", "角色", "角色"}},
++    {"class", 1, 540, {"Class", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"class_specific_magic", 1, 1076, {"Class-Specific Magic", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"combat_arts", 1, 264, {"Combat Arts", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"completed", 1, 661, {"Completed", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"consulting_ancient_officer_manuals", -1, 0, {"Consulting ancient officer manuals…", "古い士官の手引書を調べています…", "Alte Offiziershandbücher werden gewälzt…", "Consultation des anciens manuels d'officier…", "Consultando antiguos manuales de oficiales…", "Consultazione degli antichi manuali degli ufficiali…", "오래된 사관 교본을 살펴보는 중…", "正在翻閱古老的軍官手冊…", "正在翻阅古老的军官手册…"}},
++    {"crest", 1, 815, {"Crest", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"crit", 1, 284, {"Crit", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"deadline", -1, 0, {"Deadline", "期限", "Frist", "Échéance", "Plazo", "Scadenza", "기한", "期限", "期限"}},
++    {"def", 1, 271, {"Def", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"defeat_conditions", 1, 599, {"Defeat Conditions", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"dex", 1, 268, {"Dex", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"durability", 1, 626, {"Durability", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"endurance", 1, 653, {"Endurance", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"enemy", -1, 0, {"Enemy", "敵軍", "Gegner", "Ennemis", "Enemigos", "Nemici", "적군", "敵軍", "敌军"}},
++    {"enemy_units", 1, 881, {"Enemy Units", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"equipped", -1, 0, {"Equipped", "装備中", "Ausgerüstet", "Équipé", "Equipado", "Equipaggiato", "장착 중", "裝備中", "装备中"}},
++    {"exp", 1, 287, {"Exp", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"exp_max", -1, 0, {"Exp Max", "EXP MAX", "Erf. max.", "Exp max.", "Exp. máx.", "Esp. max", "EXP MAX", "EXP MAX", "EXP MAX"}},
++    {"facilities", 1, 655, {"Facilities", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"faith", 2, 7220, {"Faith", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"flying", 2, 7224, {"Flying", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"g", 1, 396, {"G", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"goals", 1, 972, {"Goals", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"hp", 1, 299, {"HP", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"heavy_armor", 2, 7222, {"Heavy Armor", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"hit", 1, 283, {"Hit", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"icons", -1, 0, {"Icons", "アイコン", "Symbole", "Icônes", "Iconos", "Icone", "아이콘", "圖示", "图标"}},
++    {"in_progress", -1, 0, {"In Progress", "進行中", "In Arbeit", "En cours", "En curso", "In corso", "진행 중", "進行中", "进行中"}},
++    {"inventory", 1, 265, {"Inventory", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"items", 1, 322, {"Items", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"lance", 2, 7215, {"Lance", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"lck", 1, 270, {"Lck", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"learned_magic", 1, 1075, {"Learned Magic", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"legend", -1, 0, {"Legend", "凡例", "Legende", "Légende", "Leyenda", "Legenda", "범례", "圖例", "图例"}},
++    {"lost_items", 1, 958, {"Lost Items", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"lost_items_in_hand", -1, 0, {"Lost Items in hand", "手持ちの落とし物", "Verlorene Items im Besitz", "Objets trouvés en main", "Objetos perdidos en mano", "Oggetti smarriti posseduti", "소지 중인 분실물", "持有的失物", "持有的失物"}},
++    {"lv", 1, 300, {"Lv", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"mag", 1, 267, {"Mag", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"map", 1, 3885, {"Map", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"markers", -1, 0, {"Markers", "マーカー", "Markierungen", "Marqueurs", "Marcadores", "Segnalini", "마커", "標記", "标记"}},
++    {"max", 1, 474, {"Max", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"monastery", -1, 0, {"Monastery", "修道院", "Kloster", "Monastère", "Monasterio", "Monastero", "수도원", "修道院", "修道院"}},
++    {"mt", 1, 282, {"Mt", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"mv", 1, 637, {"Mv", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"next", 1, 3841, {"Next", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"no_lost_items_in_hand", -1, 0, {"No lost items in hand", "手持ちの落とし物はありません", "Keine verlorenen Items im Besitz", "Aucun objet trouvé en main", "Sin objetos perdidos en mano", "Nessun oggetto smarrito posseduto", "소지 중인 분실물이 없습니다", "沒有持有的失物", "没有持有的失物"}},
++    {"none", 1, 318, {"None", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"not_available_during_battle", -1, 0, {"Not available during battle", "戦闘中は利用できません", "Im Kampf nicht verfügbar", "Indisponible pendant le combat", "No disponible durante el combate", "Non disponibile durante la battaglia", "전투 중에는 사용할 수 없습니다", "戰鬥中無法使用", "战斗中无法使用"}},
++    {"objective", -1, 0, {"Objective", "目的", "Ziel", "Objectif", "Objetivo", "Obiettivo", "목적", "目標", "目标"}},
++    {"other", 1, 656, {"Other", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"people", 1, 654, {"People", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"personal", -1, 0, {"Personal", "個人", "Persönlich", "Personnel", "Personal", "Personale", "개인", "個人", "个人"}},
++    {"player", -1, 0, {"Player", "自軍", "Spieler", "Joueur", "Jugador", "Giocatore", "플레이어", "我軍", "我军"}},
++    {"polishing_the_sword_of_the_creator", -1, 0, {"Polishing the Sword of the Creator…", "創造の剣を磨いています…", "Das Schwert der Schöpfung wird poliert…", "Polissage de l'Épée du Créateur…", "Puliendo la Espada del Creador…", "Lucidatura della Spada del Creatore…", "창조의 검을 닦는 중…", "正在擦拭創造之劍…", "正在擦拭创造之剑…"}},
++    {"preparing_the_lecture_hall", -1, 0, {"Preparing the lecture hall…", "講義室を準備しています…", "Der Vorlesungssaal wird vorbereitet…", "Préparation de la salle de cours…", "Preparando el aula…", "Preparazione dell'aula…", "강의실을 준비하는 중…", "正在準備講堂…", "正在准备讲堂…"}},
++    {"professor_level", 1, 1191, {"Professor Level", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"prt", 1, 276, {"Prt", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"quests", 1, 643, {"Quests", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"reading_the_calendar", -1, 0, {"Reading the calendar", "カレンダーを読み込んでいます", "Kalender wird gelesen", "Lecture du calendrier", "Leyendo el calendario", "Lettura del calendario", "달력을 읽는 중", "正在讀取日曆", "正在读取日历"}},
++    {"reading_the_roster", -1, 0, {"Reading the roster", "名簿を読み込んでいます", "Namensliste wird gelesen", "Lecture de la liste des élèves", "Leyendo la lista de alumnos", "Lettura dell'elenco degli studenti", "명부를 읽는 중", "正在讀取名冊", "正在读取名册"}},
++    {"ready_to_report", -1, 0, {"Ready to Report", "報告可能", "Bereit zur Meldung", "Prêt à rapporter", "Listo para informar", "Pronto per il rapporto", "보고 가능", "可回報", "可回报"}},
++    {"reason", 2, 7219, {"Reason", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"res", 1, 272, {"Res", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"reset", -1, 0, {"Reset", "リセット", "Zurücksetzen", "Réinitialiser", "Restablecer", "Ripristina", "초기화", "重設", "重置"}},
++    {"reviewing_the_war_council_s_reports", -1, 0, {"Reviewing the war council's reports…", "軍議の報告を確認しています…", "Berichte des Kriegsrats werden geprüft…", "Examen des rapports du conseil de guerre…", "Revisando los informes del consejo de guerra…", "Esame dei rapporti del consiglio di guerra…", "군의 보고를 검토하는 중…", "正在檢閱軍議報告…", "正在检阅军议报告…"}},
++    {"reward", 1, 646, {"Reward", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"riding", 2, 7223, {"Riding", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"rng", 1, 281, {"Rng", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"rsl", 1, 278, {"Rsl", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"sharpening_the_training_weapons", -1, 0, {"Sharpening the training weapons…", "訓練用の武器を研いでいます…", "Die Übungswaffen werden geschärft…", "Affûtage des armes d'entraînement…", "Afilando las armas de entrenamiento…", "Affilatura delle armi da addestramento…", "훈련용 무기를 가는 중…", "正在磨利訓練用武器…", "正在磨利训练用武器…"}},
++    {"skill_level", 1, 259, {"Skill Level", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"skills", 1, 569, {"Skills", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"spd", 1, 269, {"Spd", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"stats", 1, 257, {"Stats", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"status", 1, 893, {"Status", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"stocking_the_dining_hall", -1, 0, {"Stocking the dining hall…", "食堂の備蓄を整えています…", "Der Speisesaal wird aufgefüllt…", "Réapprovisionnement du réfectoire…", "Reabasteciendo el comedor…", "Rifornimento della sala da pranzo…", "식당에 재료를 채우는 중…", "正在補充食堂的存糧…", "正在补充食堂的存粮…"}},
++    {"str", 1, 266, {"Str", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"studying_the_tactics", -1, 0, {"Studying the tactics…", "戦術を研究しています…", "Taktiken werden studiert…", "Étude des tactiques…", "Estudiando las tácticas…", "Studio delle tattiche…", "전술을 연구하는 중…", "正在研究戰術…", "正在研究战术…"}},
++    {"sword", 2, 7214, {"Sword", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"tending_the_greenhouse", -1, 0, {"Tending the greenhouse…", "温室の手入れをしています…", "Das Gewächshaus wird gepflegt…", "Entretien de la serre…", "Cuidando el invernadero…", "Cura della serra…", "온실을 가꾸는 중…", "正在照料溫室…", "正在照料温室…"}},
++    {"third_army", 1, 883, {"Third Army", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"to_next", 1, 312, {"To next", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"turn", 1, 664, {"Turn", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"units", -1, 0, {"Units", "ユニット", "Einheiten", "Unités", "Unidades", "Unità", "유닛", "單位", "单位"}},
++    {"untapped_units", -1, 0, {"Untapped Units", "未行動のユニット", "Ungenutzte Einheiten", "Unités non jouées", "Unidades sin actuar", "Unità non mosse", "미행동 유닛", "未行動單位", "未行动单位"}},
++    {"victory_conditions", 1, 598, {"Victory Conditions", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"waiting_for_the_battle_map", -1, 0, {"Waiting for the battle map", "戦場マップを待っています", "Warten auf die Schlachtkarte", "En attente de la carte de bataille", "Esperando el mapa de batalla", "In attesa della mappa di battaglia", "전장 지도를 기다리는 중", "等待戰場地圖", "等待战场地图"}},
++    {"waiting_for_the_monastery", -1, 0, {"Waiting for the monastery", "修道院を待っています", "Warten auf das Kloster", "En attente du monastère", "Esperando el monasterio", "In attesa del monastero", "수도원을 기다리는 중", "等待修道院", "等待修道院"}},
++    {"waiting_for_the_quest_log", -1, 0, {"Waiting for the quest log", "クエスト記録を待っています", "Warten auf das Questlog", "En attente du journal de quêtes", "Esperando el registro de peticiones", "In attesa del registro missioni", "퀘스트 기록을 기다리는 중", "等待任務記錄", "等待任务记录"}},
++    {"war", -1, 0, {"War", "戦争", "Krieg", "Guerre", "Guerra", "Guerra", "전쟁", "戰爭", "战争"}},
++    {"your_units", 1, 529, {"Your Units", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
++    {"pts", 1, 463, {"pts", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
+diff --git a/native/modules/fe3h_reader.cpp b/native/modules/fe3h_reader.cpp
+index e795310..d6ff0be 100644
+--- a/native/modules/fe3h_reader.cpp
++++ b/native/modules/fe3h_reader.cpp
+@@ -3,6 +3,7 @@
+ 
+ // Fire Emblem: Three Houses 1.2.0 reader (fe3h_reader.h): the build check, guest reads, the sample (context, domains, publish) and the module actions.
+ 
++#include "fe3h_labels.h"
+ #include "fe3h_reader_internal.h"
+ 
+ #include <algorithm>
+@@ -87,6 +88,22 @@ std::optional<u64> Reader::Ptr(u64 at) const {
+ bool Reader::InMain(u64 at, u64 n) const {
+     return dsmod_sdk::InMain(base, size, at, n);
+ }
++std::string Reader::LanguageProbe() {
++    return fe3h_labels::BuildProbe(
++        [&](uint32_t index, std::string& out) { return !(out = Text(TextPart1, index)).empty(); });
++}
++int Reader::GameLanguage() const {
++    constexpr u64 LangOffset = 0x158;
++    constexpr u8 LanguageCount = 12; // msgdata: JPN, ENG_U, ENG_E, GER, FRA_E, FRA_U, ESP_E,
++                                     // ESP_U, ITA, KOR, TWN, CHN
++    if (!gl.lang_var)
++        return -1;
++    const auto obj = Ptr(gl.lang_var);
++    if (!obj)
++        return -1;
++    const auto lang = Get<u8>(*obj + LangOffset);
++    return lang && *lang < LanguageCount ? int(*lang) : -1;
++}
+ /// NUL-terminated string, read in chunks that never cross a 4 KiB page (the next page may be
+ /// unmapped); fails when no NUL is found within `max` bytes.
+ std::optional<std::string> Reader::CString(u64 at, std::size_t max) const {
+diff --git a/native/modules/fe3h_reader.h b/native/modules/fe3h_reader.h
+index 6a93045..750d31c 100644
+--- a/native/modules/fe3h_reader.h
++++ b/native/modules/fe3h_reader.h
+@@ -221,6 +221,13 @@ public:
+     void SetAssets(fe3h_assets::Library* lib) {
+         assets = lib;
+     }
++    /// The game's language index (the msgdata order: 0 JPN, 1 ENG_U, ..., 9 KOR, 10 TWN, 11 CHN;
++    /// the byte at +0x158 of the object `lang_var` points to), -1 while it cannot be read.
++    /// Tick thread only (reads guest memory like Sample).
++    int GameLanguage() const;
++    /// A few words of the game's own text in the language it runs (fe3h_labels.h, BuildProbe),
++    /// read from the in-memory text manager; empty while it is not loaded. Tick thread only.
++    std::string LanguageProbe();
+     /// The overlay images (thread-safe; load_image renders from it).
+     DangerStore& Danger() {
+         return *danger;
+diff --git a/native/modules/fe3h_text.cpp b/native/modules/fe3h_text.cpp
+index 24fb3f5..f9b8d2d 100644
+--- a/native/modules/fe3h_text.cpp
++++ b/native/modules/fe3h_text.cpp
+@@ -43,18 +43,16 @@ const XlTable* MessageText::Part(uint32_t lang, uint32_t part) {
+     const auto key = std::make_pair(lang, part);
+     if (const auto it = parts_.find(key); it != parts_.end())
+         return it->second.get();
+-    auto& slot = parts_[key];
+     const auto msg = link_.Entry(MsgDataId);
+     const auto l = msg ? fe3h_romfs::PtblChild(msg, lang) : nullptr;
+     const auto p = l ? fe3h_romfs::PtblChild(l, part) : nullptr;
+     std::vector<uint8_t> bytes;
+     if (!p || !p->ReadAll(bytes, uint64_t{16} << 20))
+-        return nullptr;
++        return nullptr; // not latched: the romfs may not be readable yet
+     auto table = std::make_unique<XlTable>();
+     if (!table->Parse(std::move(bytes)))
+         return nullptr;
+-    slot = std::move(table);
+-    return slot.get();
++    return (parts_[key] = std::move(table)).get();
+ }
+ 
+ bool MessageText::Get(uint32_t part, uint32_t index, std::string& out, uint32_t lang) {
