@@ -18,8 +18,8 @@ from refs import REFS
 from layout_fix import fix_turn_overlap
 
 ROOT = 'H:/EdenDuo'
-SRC = ROOT + '/010055D009F78000-FireEmblemThreeHousesDS-1.1.1-multilang.dsmod'   # current build (hashes)
-DST = ROOT + '/010055D009F78000-FireEmblemThreeHousesDS-1.1.1-ko.dsmod'
+SRC = ROOT + '/010055D009F78000-FireEmblemThreeHousesDS-1.1.0-multilang.dsmod'   # current build (hashes)
+DST = ROOT + '/010055D009F78000-FireEmblemThreeHousesDS-1.1.0-ko.dsmod'
 ZIP = DST + '.zip'
 
 KO_STATIC = {
