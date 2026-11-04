@@ -31,6 +31,22 @@
    `msgdata`에서 그 언어의 단어를 읽어 쓰고(게임 문구는 저장소에 없음), 게임에 없는 모듈 고유 문구 39개는
    `tools/own.py`의 번역을 씁니다.
 
+## 스크린샷
+
+위쪽이 게임 화면, 아래쪽이 컴패니언(세컨드 스크린)입니다. 모두 안드로이드의 Eden Duo 1.3.4에서 찍었고,
+라벨·이름·직업이 게임 언어를 따라 나옵니다.
+
+| 한국어 (전투) | 일본어 (전투) | 스페인어 (전투) |
+|:---:|:---:|:---:|
+| <img src="screenshots/ko-battle.png" width="300" alt="Korean battle"> | <img src="screenshots/ja-battle.png" width="300" alt="Japanese battle"> | <img src="screenshots/es-battle.png" width="300" alt="Spanish battle"> |
+
+| 스페인어 (퀘스트) | 스페인어 (로딩) | 일본어 (로딩) |
+|:---:|:---:|:---:|
+| <img src="screenshots/es-quests.png" width="300" alt="Spanish quests"> | <img src="screenshots/es-loading.png" width="300" alt="Spanish loading"> | <img src="screenshots/ja-loading.png" width="300" alt="Japanese loading"> |
+
+화면 속 그림과 문구는 게임의 것이며 각 소유자의 자산입니다. 이 저장소의 파일에는 포함되지 않고,
+스크린샷만 설명용으로 둡니다.
+
 ## 확인 상태
 
 - 한국어, 일본어 및 나머지 지원 언어는 안드로이드(Eden Duo 1.3.4)에서 화면으로 확인했습니다.
