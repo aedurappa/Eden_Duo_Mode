@@ -34,6 +34,8 @@ The change is `mods/fire-emblem-three-houses/patches/0001-fe3h-cjk-glyphs-and-la
 
 - the module reads the game's own Korean / Japanese / Chinese font atlases and code tables (from
   the player's romfs, at run time) in addition to the Latin one, so those scripts are drawn;
+- the glyph run covers the whole BMP, so the full width digits and marks (U+FF00..) of the Japanese and
+  Chinese texts are drawn too;
 - the font atlas is split into one-cell-row pages so one screen fits the host's page cache;
 - the language is found by comparing a few words from the game's memory with the game's
   message data, and the companion's fixed labels are published in that language;

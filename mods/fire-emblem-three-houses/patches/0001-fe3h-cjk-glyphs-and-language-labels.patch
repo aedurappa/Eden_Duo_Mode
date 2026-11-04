@@ -459,10 +459,10 @@ index 0ec0a20..b235ff8 100644
      const std::string_view s{reinterpret_cast<const char*>(bytes.data()), bytes.size()};
      constexpr std::string_view Magic = "FE3HFONT ";
 diff --git a/native/modules/fe3h_font.h b/native/modules/fe3h_font.h
-index 118b8b8..c1d0059 100644
+index 118b8b8..6cca406 100644
 --- a/native/modules/fe3h_font.h
 +++ b/native/modules/fe3h_font.h
-@@ -106,4 +106,76 @@ bool Build(Face face, const GameTables& tables, const std::vector<uint32_t>& cod
+@@ -106,4 +106,77 @@ bool Build(Face face, const GameTables& tables, const std::vector<uint32_t>& cod
  // "FE3HFONT sans" (any trailing text ignored). False for anything else.
  bool ParseRequest(std::span<const uint8_t> bytes, Face& face);
  
@@ -508,7 +508,8 @@ index 118b8b8..c1d0059 100644
 +inline constexpr uint32_t LatinPages = (AtlasHeight + PageRows - 1) / PageRows;  // 10
 +inline constexpr uint32_t CjkPages = (CjkAtlasH + PageRows - 1) / PageRows;      // 79
 +inline constexpr uint32_t HangulAdvance = 51, CjkAdvance = 52;
-+inline constexpr uint32_t CjkLastCodepoint = 0xD7FF; // below the surrogates; keeps the run dense
++inline constexpr uint32_t CjkLastCodepoint = 0xFFFF; // the whole BMP: the full width forms (U+FF00..) are the digits,
++                                                       // commas and marks the Japanese and Chinese texts use
 +
 +// Game language index (msgdata order: 0 JPN, 1.. Latin languages, 9 KOR, 10 TWN, 11 CHN) -> the
 +// CJK set for it; false for the Latin-script languages (and anything out of range).

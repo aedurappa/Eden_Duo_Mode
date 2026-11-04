@@ -36,6 +36,9 @@ int main() {
         CHECK(G(f, 0xD7A3 - 0).advance == 0 || true);
         // Kanji shapes follow the active language's atlas slot
         auto slot_of = [&](uint32_t cp) { return (G(f, cp).y - AtlasHeight) / CjkAtlasH; };
+        // the full width forms (digits, comma, marks) of the Japanese / Chinese texts
+        if (variant != 3) { CHECK(G(f, 0xFF13).advance == CjkAdvance); CHECK(G(f, 0xFF1F).advance == CjkAdvance); }
+        if (variant == 2 || variant == 1) CHECK(G(f, 0xFF0C).advance == CjkAdvance);
         if (variant == 0) { CHECK(G(f, 0x56FD).advance && slot_of(0x56FD) == uint32_t(Lang::Jpn)); } // 国 JPN
         if (variant == 1) { CHECK(G(f, 0x570B).advance && slot_of(0x570B) == uint32_t(Lang::Twn)); } // 國 TWN
         if (variant == 2) { CHECK(G(f, 0x56FD).advance && slot_of(0x56FD) == uint32_t(Lang::Chn)); } // 国 CHN
