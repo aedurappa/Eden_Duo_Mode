@@ -34,22 +34,46 @@
 ## 스크린샷
 
 위쪽이 게임 화면, 아래쪽이 컴패니언(세컨드 스크린)입니다. 모두 안드로이드의 Eden Duo 1.3.4에서 찍었고,
-라벨·이름·직업이 게임 언어를 따라 나옵니다.
+라벨·이름·직업·퀘스트 본문이 게임 언어를 따라 나옵니다. 화면 아래의 ◀ ● 는 기기의 안드로이드 버튼입니다.
 
-| 한국어 (전투) | 일본어 (전투) | 스페인어 (전투) |
-|:---:|:---:|:---:|
-| <img src="screenshots/ko-battle.png" width="300" alt="Korean battle"> | <img src="screenshots/ja-battle.png" width="300" alt="Japanese battle"> | <img src="screenshots/es-battle.png" width="300" alt="Spanish battle"> |
+### 한국어
 
-| 스페인어 (퀘스트) | 스페인어 (로딩) | 일본어 (로딩) |
+| 캐릭터 | 유닛 목록 | 퀘스트 |
 |:---:|:---:|:---:|
-| <img src="screenshots/es-quests.png" width="300" alt="Spanish quests"> | <img src="screenshots/es-loading.png" width="300" alt="Spanish loading"> | <img src="screenshots/ja-loading.png" width="300" alt="Japanese loading"> |
+| <img src="screenshots/ko-char.jpg" width="300" alt="한국어 캐릭터"> | <img src="screenshots/ko-units.jpg" width="300" alt="한국어 유닛 목록"> | <img src="screenshots/ko-quests.jpg" width="300" alt="한국어 퀘스트"> |
+
+| 전투 예측 | 로딩 |
+|:---:|:---:|
+| <img src="screenshots/ko-forecast.jpg" width="300" alt="한국어 전투 예측"> | <img src="screenshots/ko-loading.jpg" width="300" alt="한국어 로딩"> |
+
+### 일본어
+
+| 캐릭터 | 퀘스트 | 분실물 |
+|:---:|:---:|:---:|
+| <img src="screenshots/ja-char.jpg" width="300" alt="일본어 캐릭터"> | <img src="screenshots/ja-quests.jpg" width="300" alt="일본어 퀘스트"> | <img src="screenshots/ja-lost-items.jpg" width="300" alt="일본어 분실물"> |
+
+| 로딩 |
+|:---:|
+| <img src="screenshots/ja-loading.jpg" width="300" alt="일본어 로딩"> |
+
+### 스페인어
+
+| 캐릭터 | 로딩 |
+|:---:|:---:|
+| <img src="screenshots/es-char.jpg" width="300" alt="스페인어 캐릭터"> | <img src="screenshots/es-loading.jpg" width="300" alt="스페인어 로딩"> |
+
+### 프랑스어
+
+| 캐릭터 | 로딩 |
+|:---:|:---:|
+| <img src="screenshots/fr-char.jpg" width="300" alt="프랑스어 캐릭터"> | <img src="screenshots/fr-loading.jpg" width="300" alt="프랑스어 로딩"> |
 
 화면 속 그림과 문구는 게임의 것이며 각 소유자의 자산입니다. 이 저장소의 파일에는 포함되지 않고,
 스크린샷만 설명용으로 둡니다.
 
 ## 확인 상태
 
-- 한국어, 일본어 및 나머지 지원 언어는 안드로이드(Eden Duo 1.3.4)에서 화면으로 확인했습니다.
+- 한국어, 일본어, 스페인어, 프랑스어 화면은 위 스크린샷으로 확인했고, 나머지 지원 언어도 안드로이드(Eden Duo 1.3.4)에서 화면으로 확인했습니다.
 - 모듈 고유 문구 39개의 번역은 AI의 도움으로 쓴 것이라 어색한 표현이 있을 수 있습니다. 고칠 곳은 `tools/own.py`입니다.
 
 ## 알려진 한계
