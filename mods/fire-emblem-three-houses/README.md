@@ -8,6 +8,11 @@
 > 바탕: [`igawa6/eden-duo-companions`](https://github.com/igawa6/eden-duo-companions) 커밋 `fc0f85e`.
 > 출처와 라이선스는 [../../NOTICE.md](../../NOTICE.md)를 보세요.
 
+## 업스트림 상태
+
+- **글자 표시(한글·일본어·중국어 글꼴)**: 공식 컴패니언 **1.0.1**에 반영되었습니다(PR [#22](https://github.com/igawa6/eden-duo-companions/pull/22), 2026-11-06). 공식판만 쓰셔도 이름·직업·스탯·퀘스트 본문이 나옵니다: [공식 릴리스 1.0.1](https://github.com/igawa6/eden-duo-companions/releases/tag/fire-emblem-three-houses-1.0.1).
+- **고정 문구(라벨)를 게임 언어로 표시**: PR [#23](https://github.com/igawa6/eden-duo-companions/pull/23)에서 검토 중입니다. 반영되기 전까지는 이 저장소의 패키지(`multilang`, `ko`)로 쓸 수 있습니다.
+
 ## 패키지 두 종류
 
 | 파일 | 라벨 문구 | 언어 |

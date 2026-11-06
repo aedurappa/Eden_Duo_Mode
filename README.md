@@ -10,7 +10,7 @@
 
 | 모드 | 게임 | Title ID | 게임 버전 | 상태 | 다운로드 |
 |---|---|---|---|---|---|
-| [Fire Emblem: Three Houses — 한글/다국어](mods/fire-emblem-three-houses/) | 파이어 엠블렘 풍화설월 | `010055D009F78000` | 1.2.0 | 한국어·일본어 등 실기기 확인 | [Releases](../../releases) |
+| [Fire Emblem: Three Houses — 한글/다국어](mods/fire-emblem-three-houses/) | 파이어 엠블렘 풍화설월 | `010055D009F78000` | 1.2.0 | 글자 표시: 공식 1.0.1에 반영됨 / 라벨: [PR #23](https://github.com/igawa6/eden-duo-companions/pull/23) 검토 중 | [Releases](../../releases) |
 
 ## 규칙
 

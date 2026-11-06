@@ -45,6 +45,9 @@ The change is `mods/fire-emblem-three-houses/patches/0001-fe3h-cjk-glyphs-and-la
   text, so the game's wider words (TURN, TURNO) and a two digit number do not overlap
   (`layout_fix.py`).
 
+The font part of this change was merged into the companion by igawa6 on 2026-11-06 (pull request
+#22, released as 1.0.1, with a credit in its README). The labels are proposed in pull request #23.
+
 Both packages in the Releases were built from exactly this source (see the README of the mod for
 the build steps).
 
